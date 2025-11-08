@@ -152,6 +152,15 @@ def wait_for_page_ready(driver, timeout=15):
 def get_mobile_number(reg_no, chassis_no_last5):
     start_time = time.time()
     
+    # Input validation
+    if not reg_no or not chassis_no_last5:
+        return {
+            "success": False,
+            "mobile_number": "",
+            "error": "Registration number and chassis last 5 digits are required",
+            "response_time_seconds": round(time.time() - start_time, 2)
+        }
+    
     options = webdriver.ChromeOptions()
     options.add_argument('--headless=new')
     options.add_argument('--no-sandbox')
@@ -159,9 +168,21 @@ def get_mobile_number(reg_no, chassis_no_last5):
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-extensions")
+    
+    # NEW: Anti-detection arguments added
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--no-first-run")
+    options.add_argument("--no-default-browser-check")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("--disable-translate")
     options.add_argument("--disable-images")
     options.add_argument("--blink-settings=imagesEnabled=false")
-    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
+    options.add_argument("user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    
+    # NEW: Anti-detection experimental options
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option('useAutomationExtension', False)
 
     _temp_profile = _mk_temp_profile()
     options.add_argument(f"--user-data-dir={_temp_profile}")
@@ -176,18 +197,32 @@ def get_mobile_number(reg_no, chassis_no_last5):
     driver = None
     try:
         driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=options)
-        wait = WebDriverWait(driver, 15)
+        
+        # NEW: Execute anti-detection script
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        
+        # CHANGED: Increased timeout from 15 to 30
+        wait = WebDriverWait(driver, 30)
 
         homepage_url = "https://vahan.parivahan.gov.in/vahanservice/vahan/ui/statevalidation/homepage.xhtml"
+        
+        # NEW: Added logging
+        logger.info(f"Loading homepage: {homepage_url}")
         driver.get(homepage_url)
-        wait_for_page_ready(driver)
+        
+        # CHANGED: Increased timeout
+        wait_for_page_ready(driver, 20)
 
         origin = _get_origin(driver.current_url)
         backend_logout_sweep(driver, origin)
         _hard_clear_state(driver, origin)
         
+        # Fresh load with cache busting
         driver.get(homepage_url + f"?_cb={int(time.time())}{_rand_suffix()}")
-        wait_for_page_ready(driver)
+        wait_for_page_ready(driver, 20)
+
+        # NEW: Wait for page elements to load
+        time.sleep(3)
 
         try:
             close_btn = driver.find_element(By.CSS_SELECTOR, "#updatemobileno .btn-close")
@@ -196,6 +231,7 @@ def get_mobile_number(reg_no, chassis_no_last5):
         except:
             pass
 
+        # CHANGED: Improved registration input finding with explicit waits
         regn_input = None
         selectors = [
             (By.ID, "regnid"),
@@ -207,12 +243,16 @@ def get_mobile_number(reg_no, chassis_no_last5):
         
         for selector, value in selectors:
             try:
-                regn_input = driver.find_element(selector, value)
+                # NEW: Use explicit wait for each selector
+                regn_input = WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((selector, value))
+                )
                 if regn_input:
                     regn_input.clear()
                     regn_input.send_keys(reg_no)
+                    logger.info(f"Entered registration number: {reg_no}")
                     break
-            except:
+            except Exception as e:
                 continue
 
         if not regn_input:
@@ -224,63 +264,91 @@ def get_mobile_number(reg_no, chassis_no_last5):
         if handle_prev_session_modal(driver):
             _hard_clear_state(driver, origin)
             _hard_reload(driver)
-            time.sleep(0.5)
+            time.sleep(2)  # CHANGED: Increased from 0.5 to 2
 
-        handle_any_dialog_and_proceed(driver, wait, timeout=8)
+        handle_any_dialog_and_proceed(driver, wait, timeout=15)  # CHANGED: Increased timeout
 
+        # CHANGED: Increased wait time for URL change
         try:
-            wait.until(EC.url_contains("login.xhtml"))
+            WebDriverWait(driver, 30).until(EC.url_contains("login.xhtml"))
+            logger.info("Successfully navigated to login page")
         except TimeoutException:
+            logger.warning("Timeout waiting for login page, trying recovery...")
             if handle_prev_session_modal(driver):
                 _hard_clear_state(driver, origin)
                 driver.get(homepage_url + f"?_cb={int(time.time())}{_rand_suffix()}")
                 handle_primefaces_checkbox(driver, wait)
                 click_proceed_button(driver, wait)
-                wait.until(EC.url_contains("login.xhtml"))
+                WebDriverWait(driver, 30).until(EC.url_contains("login.xhtml"))
             else:
-                raise
+                raise Exception("Failed to navigate to login page")
 
+        # CHANGED: Improved fitness icon clicking with explicit waits
+        fitness_found = False
         fitness_xpaths = [
             "//a[.//div[contains(text(), 'Re-Schedule Renewal of Fitness Application')]]",
             "//a[contains(@href, 'fitness')]",
-            "//a[.//div[contains(text(), 'Fitness')]]"
+            "//a[.//div[contains(text(), 'Fitness')]]",
+            "//a[contains(@onclick, 'fitness')]"  # NEW: Added additional selector
         ]
+        
         for xpath in fitness_xpaths:
             try:
-                fitness_icon = driver.find_element(By.XPATH, xpath)
+                fitness_icon = WebDriverWait(driver, 10).until(
+                    EC.element_to_be_clickable((By.XPATH, xpath))
+                )
                 js_click(driver, fitness_icon)
+                fitness_found = True
+                logger.info("Clicked fitness icon")
                 break
             except:
                 continue
 
-        wait.until(EC.url_contains("form_reschedule_fitness.xhtml"))
-        
-        chassis_input = driver.find_element(By.ID, "balanceFeesFine:tf_chasis_no")
-        chassis_input.send_keys(chassis_no_last5)
+        if not fitness_found:
+            raise Exception("Could not find fitness icon")
 
-        validate_button = driver.find_element(By.ID, "balanceFeesFine:validate_dtls")
+        # CHANGED: Increased wait time for fitness page
+        WebDriverWait(driver, 30).until(EC.url_contains("form_reschedule_fitness.xhtml"))
+        
+        # CHANGED: Use explicit wait for chassis input
+        chassis_input = WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.ID, "balanceFeesFine:tf_chasis_no"))
+        )
+        chassis_input.clear()
+        chassis_input.send_keys(chassis_no_last5)
+        logger.info(f"Entered chassis last 5: {chassis_no_last5}")
+
+        # CHANGED: Use explicit wait for validate button
+        validate_button = WebDriverWait(driver, 20).until(
+            EC.element_to_be_clickable((By.ID, "balanceFeesFine:validate_dtls"))
+        )
         js_click(driver, validate_button)
 
+        # CHANGED: Improved mobile number retrieval with better waiting
         mobile_number = ""
-        for _ in range(5):
+        for i in range(10):  # CHANGED: Increased from 5 to 10 attempts
             try:
-                mobile_input = driver.find_element(By.ID, "balanceFeesFine:tf_mobile")
+                mobile_input = WebDriverWait(driver, 5).until(
+                    EC.presence_of_element_located((By.ID, "balanceFeesFine:tf_mobile"))
+                )
                 mobile_number = mobile_input.get_attribute("value")
-                if mobile_number:
+                if mobile_number and len(mobile_number) >= 10:
+                    logger.info(f"Found mobile number: {mobile_number}")
                     break
             except:
                 pass
-            time.sleep(0.5)
+            time.sleep(1)  # CHANGED: Increased from 0.5 to 1 second
 
         if mobile_number:
             result["success"] = True
             result["mobile_number"] = mobile_number
         else:
-            result["error"] = "Mobile number field is empty"
+            result["error"] = "Mobile number field is empty or not populated"
 
     except Exception as e:
-        result["error"] = f"{type(e).__name__}: {str(e)}"
-        logger.error(f"Error in get_mobile_number: {str(e)}")
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        logger.error(f"Error in get_mobile_number: {error_msg}")
+        result["error"] = error_msg
 
     finally:
         if driver:
